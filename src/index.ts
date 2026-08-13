@@ -1,11 +1,11 @@
-﻿import { McpServer } from "@modelcontextprotocol/server";
+import { McpServer } from "@modelcontextprotocol/server";
 import { McpServer as LegacyMcpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createLegacyMcpHandler } from "agents/mcp";
 import { createMcpHandler } from "agents/mcp/server";
 import { withX402, type X402Config } from "agents/x402";
 import { z } from "zod";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const BAZAAR_SEARCH_ENDPOINT =
 	"https://api.cdp.coinbase.com/platform/v2/x402/discovery/search";
 
@@ -48,6 +48,20 @@ export type RankedResource = BazaarResource & {
 	estimatedUsdPrice: number | null;
 };
 
+export type CandidateDecision = {
+	selected: RankedResource | null;
+	alternatives: RankedResource[];
+	overBudgetAlternatives: Array<
+		RankedResource & {
+			budgetGapUsd: number;
+		}
+	>;
+};
+
+function roundUsd(value: number) {
+	return Math.round(value * 1_000_000) / 1_000_000;
+}
+
 function usdcAmountToUsd(amount?: string): number | null {
 	if (!amount || !/^\d+$/.test(amount)) return null;
 
@@ -89,13 +103,49 @@ export function rankBazaarResources(
 
 			return {
 				...resource,
-				agenticBuyerScore: Math.round(
-					(relevanceScore + priceScore + payerScore + usageScore) * 100,
-				) / 100,
+				agenticBuyerScore:
+					Math.round(
+						(relevanceScore + priceScore + payerScore + usageScore) * 100,
+					) / 100,
 				estimatedUsdPrice: price,
 			};
 		})
 		.sort((a, b) => b.agenticBuyerScore - a.agenticBuyerScore);
+}
+
+export function decideCandidates(
+	resources: BazaarResource[],
+	budgetUsd: number,
+): CandidateDecision {
+	const ranked = rankBazaarResources(resources, budgetUsd);
+
+	const withinBudget = ranked.filter(
+		(candidate) =>
+			candidate.estimatedUsdPrice !== null &&
+			candidate.estimatedUsdPrice <= budgetUsd,
+	);
+
+	const overBudget = ranked
+		.filter(
+			(candidate): candidate is RankedResource & { estimatedUsdPrice: number } =>
+				candidate.estimatedUsdPrice !== null &&
+				candidate.estimatedUsdPrice > budgetUsd,
+		)
+		.sort((a, b) => {
+			const priceDifference = a.estimatedUsdPrice - b.estimatedUsdPrice;
+			return priceDifference !== 0
+				? priceDifference
+				: b.agenticBuyerScore - a.agenticBuyerScore;
+		});
+
+	return {
+		selected: withinBudget[0] ?? null,
+		alternatives: withinBudget.slice(1, 5),
+		overBudgetAlternatives: overBudget.slice(0, 5).map((candidate) => ({
+			...candidate,
+			budgetGapUsd: roundUsd(candidate.estimatedUsdPrice - budgetUsd),
+		})),
+	};
 }
 
 export function buildBazaarSearchUrl({
@@ -105,7 +155,7 @@ export function buildBazaarSearchUrl({
 	limit = 5,
 }: {
 	query: string;
-	budgetUsd: number;
+	budgetUsd?: number;
 	network?: string;
 	limit?: number;
 }) {
@@ -113,22 +163,26 @@ export function buildBazaarSearchUrl({
 	url.searchParams.set("query", query.trim());
 	url.searchParams.set("network", network);
 	url.searchParams.set("asset", "usdc");
-	url.searchParams.set("maxUsdPrice", String(budgetUsd));
-	url.searchParams.set("limit", String(Math.min(Math.max(limit, 1), 10)));
+
+	if (budgetUsd !== undefined) {
+		url.searchParams.set("maxUsdPrice", String(budgetUsd));
+	}
+
+	url.searchParams.set("limit", String(Math.min(Math.max(limit, 1), 20)));
 	return url.toString();
 }
 
-async function createBuyerQuote({
+async function searchBazaar({
 	query,
 	budgetUsd,
 	network,
 	limit,
 }: {
 	query: string;
-	budgetUsd: number;
+	budgetUsd?: number;
 	network: string;
 	limit: number;
-}) {
+}): Promise<BazaarSearchResponse> {
 	const searchUrl = buildBazaarSearchUrl({
 		query,
 		budgetUsd,
@@ -146,9 +200,56 @@ async function createBuyerQuote({
 		throw new Error(`x402 Bazaar search failed with HTTP ${response.status}.`);
 	}
 
-	const data = (await response.json()) as BazaarSearchResponse;
-	const ranked = rankBazaarResources(data.resources ?? [], budgetUsd);
-	const selected = ranked[0] ?? null;
+	return (await response.json()) as BazaarSearchResponse;
+}
+
+async function createBuyerQuote({
+	query,
+	budgetUsd,
+	network,
+	limit,
+}: {
+	query: string;
+	budgetUsd: number;
+	network: string;
+	limit: number;
+}) {
+	const inBudgetSearch = await searchBazaar({
+		query,
+		budgetUsd,
+		network,
+		limit,
+	});
+
+	let marketSearchUsed = false;
+	let resources = inBudgetSearch.resources ?? [];
+	let partialResults = inBudgetSearch.partialResults ?? false;
+	let searchMethod = inBudgetSearch.searchMethod ?? "unknown";
+
+	// A useful buyer should not simply stop when a strict budget search is empty.
+	// Scan the same market without the price ceiling so the caller can see the
+	// nearest alternatives and exactly how far they are above budget.
+	if (resources.length === 0) {
+		const marketSearch = await searchBazaar({
+			query,
+			network,
+			limit: Math.max(limit, 10),
+		});
+
+		marketSearchUsed = true;
+		resources = marketSearch.resources ?? [];
+		partialResults = marketSearch.partialResults ?? false;
+		searchMethod = marketSearch.searchMethod ?? searchMethod;
+	}
+
+	const decision = decideCandidates(resources, budgetUsd);
+	const closestOverBudget = decision.overBudgetAlternatives[0] ?? null;
+
+	const marketStatus = decision.selected
+		? "MATCH_FOUND"
+		: closestOverBudget
+			? "OVER_BUDGET_OPTIONS_FOUND"
+			: "NO_MATCH";
 
 	return {
 		service: "AgenticBuyer",
@@ -158,15 +259,20 @@ async function createBuyerQuote({
 		budgetUsd,
 		network,
 		currency: "USDC",
-		selected,
-		alternatives: ranked.slice(1, 5),
-		candidateCount: ranked.length,
-		partialResults: data.partialResults ?? false,
-		searchMethod: data.searchMethod ?? "unknown",
-		executionReady: false,
-		nextAction: selected
-			? "Use the selected provider details for a downstream purchase. Automatic provider payment is the next AgenticBuyer milestone."
-			: "No provider matched this request and budget. Increase the budget or broaden the query.",
+		marketStatus,
+		marketSearchUsed,
+		selected: decision.selected,
+		alternatives: decision.alternatives,
+		overBudgetAlternatives: decision.overBudgetAlternatives,
+		candidateCount: resources.length,
+		partialResults,
+		searchMethod,
+		executionReady: Boolean(decision.selected),
+		nextAction: decision.selected
+			? "A provider is inside budget. AgenticBuyer can prepare this route for downstream purchase execution."
+			: closestOverBudget
+				? `No provider is inside the $${budgetUsd} budget. The closest observed option is $${closestOverBudget.estimatedUsdPrice}, which is $${closestOverBudget.budgetGapUsd} over budget.`
+				: "No relevant provider was found in the current Bazaar results. Broaden the request or try another network.",
 	};
 }
 
@@ -243,13 +349,13 @@ function createPaidServer(env: Env) {
 
 	server.paidTool(
 		"buyer_quote",
-		"Search the x402 Bazaar, enforce a provider budget, score candidates, and return AgenticBuyer's preferred provider route. This quote does not execute the downstream provider purchase yet.",
+		"Search the x402 Bazaar, enforce a provider budget, score candidates, and return AgenticBuyer's preferred provider route plus nearest over-budget alternatives when necessary.",
 		0.01,
 		{
 			query: z.string().min(2).max(300),
 			budgetUsd: z.number().positive().max(10),
 			network: z.string().optional(),
-			limit: z.number().int().min(1).max(10).optional(),
+			limit: z.number().int().min(1).max(20).optional(),
 		},
 		{},
 		async ({ query, budgetUsd, network, limit }) => {
@@ -326,6 +432,13 @@ export default {
 			tools: {
 				free: ["buyer_ping"],
 				paid: ["buyer_paid_test", "buyer_quote"],
+			},
+			capabilities: {
+				discovery: true,
+				budgetEnforcement: true,
+				qualityRanking: true,
+				overBudgetFallback: true,
+				downstreamExecution: false,
 			},
 		});
 	},
