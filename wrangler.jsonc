@@ -14,6 +14,24 @@
 
   "upload_source_maps": true,
 
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SPEND_LEDGER",
+        "class_name": "SpendLedger"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v0.8-spend-ledger",
+      "new_sqlite_classes": [
+        "SpendLedger"
+      ]
+    }
+  ],
+
   "vars": {
     "PAY_TO": "0xc7F3a2F0df0BE61d3a6f3b16B71836329A33ce46",
     "X402_NETWORK": "base-sepolia"

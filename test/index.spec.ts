@@ -22,7 +22,7 @@ const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 describe("AgenticBuyer worker", () => {
-	it("returns a healthy v0.7 response", async () => {
+	it("returns a healthy v0.8 response", async () => {
 		const request = new IncomingRequest("http://example.com/health");
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);
@@ -32,7 +32,7 @@ describe("AgenticBuyer worker", () => {
 		expect(await response.json()).toEqual({
 			status: "ok",
 			service: "AgenticBuyer",
-			version: "0.7.0",
+			version: "0.8.0",
 		});
 	});
 
@@ -44,11 +44,14 @@ describe("AgenticBuyer worker", () => {
 			capabilities: Record<string, boolean | number>;
 		};
 
-		expect(body.version).toBe("0.7.0");
+		expect(body.version).toBe("0.8.0");
 		expect(body.tools.paid).toContain("buyer_execute");
 		expect(body.capabilities.downstreamExecution).toBe(true);
 		expect(body.capabilities.liveSpendGate).toBe(true);
 		expect(body.capabilities.hardProviderSpendCapUsd).toBe(0.01);
+		expect(body.capabilities.dailyProviderSpendCapUsd).toBe(0.05);
+		expect(body.capabilities.duplicatePurchaseProtection).toBe(true);
+		expect(body.capabilities.persistentSpendLedger).toBe(true);
 	});
 
 	it("keeps live spending locked by default", async () => {
@@ -252,6 +255,7 @@ describe("AgenticBuyer provider purchase safety", () => {
 			PAY_TO: "0x0000000000000000000000000000000000000000",
 			X402_NETWORK: "base-sepolia",
 			AGENTICBUYER_BUYER_PRIVATE_KEY: testPrivateKey,
+			SPEND_LEDGER: {},
 		} as never);
 
 		expect(first.buyerWalletConfigured).toBe(true);
@@ -262,10 +266,97 @@ describe("AgenticBuyer provider purchase safety", () => {
 			PAY_TO: first.buyerWalletAddress!,
 			X402_NETWORK: "base-sepolia",
 			AGENTICBUYER_BUYER_PRIVATE_KEY: testPrivateKey,
+			SPEND_LEDGER: {},
 		} as never);
 
 		expect(matched.receivingWalletMatchesBuyer).toBe(true);
 		expect(matched.liveSpendEnabled).toBe(false);
 		expect(matched.readyToArm).toBe(true);
+	});
+});
+
+
+describe("AgenticBuyer persistent spend ledger", () => {
+	type LedgerStub = {
+		fetch(input: string, init?: RequestInit): Promise<Response>;
+	};
+
+	function newLedger() {
+		const namespace = (env as unknown as {
+			SPEND_LEDGER: {
+			idFromName(name: string): unknown;
+			get(id: unknown): LedgerStub;
+		};
+		}).SPEND_LEDGER;
+		const id = namespace.idFromName(`test-${crypto.randomUUID()}`);
+		return namespace.get(id);
+	}
+
+	it("blocks an identical purchase inside the duplicate window", async () => {
+		const ledger = newLedger();
+		const body = {
+			fingerprint: "abc123",
+			amountUsd: 0.001,
+			provider: "https://x402.example.com/data",
+		};
+
+		const first = await ledger.fetch("https://ledger/reserve", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		const firstBody = (await first.json()) as {
+			allowed: boolean;
+			reason: string;
+		};
+
+		const second = await ledger.fetch("https://ledger/reserve", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		const secondBody = (await second.json()) as {
+			allowed: boolean;
+			reason: string;
+		};
+
+		expect(firstBody.allowed).toBe(true);
+		expect(secondBody.allowed).toBe(false);
+		expect(secondBody.reason).toBe("DUPLICATE_PURCHASE");
+	});
+
+	it("enforces the five-cent daily provider-spend ceiling", async () => {
+		const ledger = newLedger();
+
+		for (let i = 0; i < 5; i += 1) {
+			const response = await ledger.fetch("https://ledger/reserve", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					fingerprint: `daily-${i}`,
+					amountUsd: 0.01,
+					provider: `https://x402.example.com/data-${i}`,
+				}),
+			});
+			const body = (await response.json()) as { allowed: boolean };
+			expect(body.allowed).toBe(true);
+		}
+
+		const blocked = await ledger.fetch("https://ledger/reserve", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				fingerprint: "daily-6",
+				amountUsd: 0.001,
+				provider: "https://x402.example.com/data-6",
+			}),
+		});
+		const blockedBody = (await blocked.json()) as {
+			allowed: boolean;
+			reason: string;
+		};
+
+		expect(blockedBody.allowed).toBe(false);
+		expect(blockedBody.reason).toBe("DAILY_SPEND_LIMIT_REACHED");
 	});
 });

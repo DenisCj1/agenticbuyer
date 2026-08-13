@@ -7,14 +7,17 @@ import { createMcpHandler } from "agents/mcp/server";
 import { withX402, type X402Config } from "agents/x402";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
+export { SpendLedger } from "./spend-ledger";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const BAZAAR_SEARCH_ENDPOINT =
 	"https://api.cdp.coinbase.com/platform/v2/x402/discovery/search";
 
 const BASE_MAINNET = "eip155:8453";
 const BASE_SEPOLIA = "eip155:84532";
 const HARD_MAX_PROVIDER_SPEND_USD = 0.01;
+const HARD_DAILY_PROVIDER_SPEND_USD = 0.05;
+const DUPLICATE_PURCHASE_WINDOW_MS = 10 * 60 * 1000;
 const MAX_PROVIDER_RESULT_CHARS = 12_000;
 
 const USDC_BY_NETWORK: Record<string, string> = {
@@ -22,9 +25,19 @@ const USDC_BY_NETWORK: Record<string, string> = {
 	[BASE_SEPOLIA]: "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
 };
 
+type SpendLedgerStub = {
+	fetch(input: string | Request, init?: RequestInit): Promise<Response>;
+};
+
+type SpendLedgerNamespace = {
+	idFromName(name: string): unknown;
+	get(id: unknown): SpendLedgerStub;
+};
+
 type PurchaseEnv = Env & {
 	AGENTICBUYER_BUYER_PRIVATE_KEY?: string;
 	AGENTICBUYER_LIVE_SPEND_ENABLED?: string;
+	SPEND_LEDGER?: SpendLedgerNamespace;
 };
 
 type BazaarPaymentRequirement = {
@@ -590,6 +603,115 @@ function privateKeyLooksValid(value?: string): value is `0x${string}` {
 	return Boolean(value && /^0x[a-fA-F0-9]{64}$/.test(value));
 }
 
+type SpendLedgerResponse = Record<string, unknown> & {
+	allowed?: boolean;
+	reason?: string;
+};
+
+function preferredQuotedRequirement(resource: BazaarResource) {
+	const compatible = (resource.accepts ?? [])
+		.filter((requirement) =>
+			isCompatibleUsdcRequirement(requirement, BASE_MAINNET),
+		)
+		.map((requirement) => ({
+			requirement,
+			amountUsd: usdcAmountToUsd(requirement.amount),
+		}))
+		.filter(
+			(
+				item,
+			): item is {
+				requirement: BazaarPaymentRequirement;
+				amountUsd: number;
+			} => item.amountUsd !== null,
+		)
+		.sort((a, b) => a.amountUsd - b.amountUsd);
+
+	return compatible[0] ?? null;
+}
+
+async function purchaseFingerprint({
+	query,
+	resource,
+	requirement,
+}: {
+	query: string;
+	resource: string;
+	requirement: BazaarPaymentRequirement;
+}) {
+	const source = [
+		query.trim().toLowerCase(),
+		canonicalUrl(resource),
+		requirement.network ?? "",
+		requirement.asset?.toLowerCase() ?? "",
+		requirement.amount ?? "",
+		requirement.payTo?.toLowerCase() ?? "",
+	].join("|");
+
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(source),
+	);
+
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
+}
+
+async function callSpendLedger(
+	env: PurchaseEnv,
+	path: "/reserve" | "/finalize" | "/status",
+	body?: unknown,
+): Promise<SpendLedgerResponse> {
+	if (!env.SPEND_LEDGER) {
+		throw new Error("Spend ledger binding is not configured.");
+	}
+
+	const ledgerId = env.SPEND_LEDGER.idFromName("agenticbuyer-global-spend-ledger");
+	const stub = env.SPEND_LEDGER.get(ledgerId);
+	const response = await stub.fetch(`https://spend-ledger${path}`, {
+		method: body === undefined ? "GET" : "POST",
+		headers:
+			body === undefined
+				? undefined
+				: {
+						"content-type": "application/json",
+					},
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+
+	if (!response.ok) {
+		throw new Error(`Spend ledger returned HTTP ${response.status}.`);
+	}
+
+	return (await response.json()) as SpendLedgerResponse;
+}
+
+async function fullSpendStatus(env: PurchaseEnv) {
+	const gate = getSpendGateStatus(env);
+
+	if (!env.SPEND_LEDGER) {
+		return {
+			...gate,
+			ledger: null,
+		};
+	}
+
+	try {
+		return {
+			...gate,
+			ledger: await callSpendLedger(env, "/status"),
+		};
+	} catch (error) {
+		return {
+			...gate,
+			ledger: null,
+			ledgerError:
+				error instanceof Error ? error.message : "Spend ledger unavailable.",
+		};
+	}
+}
+
 export function getSpendGateStatus(env: PurchaseEnv) {
 	const privateKey = env.AGENTICBUYER_BUYER_PRIVATE_KEY;
 	let buyerWalletAddress: string | null = null;
@@ -608,6 +730,7 @@ export function getSpendGateStatus(env: PurchaseEnv) {
 
 	const liveSpendEnabled =
 		env.AGENTICBUYER_LIVE_SPEND_ENABLED?.trim().toLowerCase() === "true";
+	const ledgerConfigured = Boolean(env.SPEND_LEDGER);
 
 	return {
 		service: "AgenticBuyer",
@@ -621,9 +744,13 @@ export function getSpendGateStatus(env: PurchaseEnv) {
 		providerNetwork: BASE_MAINNET,
 		currency: "USDC",
 		hardMaxProviderSpendUsd: HARD_MAX_PROVIDER_SPEND_USD,
+		dailyProviderSpendCapUsd: HARD_DAILY_PROVIDER_SPEND_USD,
+		duplicateWindowMinutes: DUPLICATE_PURCHASE_WINDOW_MS / 60_000,
+		ledgerConfigured,
 		readyToArm:
 			buyerWalletAddress !== null &&
 			receivingWalletMatchesBuyer &&
+			ledgerConfigured &&
 			!liveSpendEnabled,
 	};
 }
@@ -677,6 +804,16 @@ async function executeProviderPurchase({
 			version: VERSION,
 			executed: false,
 			error: "BUYER_WALLET_MISMATCH",
+			gate,
+		};
+	}
+
+	if (!gate.ledgerConfigured) {
+		return {
+			service: "AgenticBuyer",
+			version: VERSION,
+			executed: false,
+			error: "SPEND_LEDGER_NOT_CONFIGURED",
 			gate,
 		};
 	}
@@ -747,9 +884,50 @@ async function executeProviderPurchase({
 		};
 	}
 
+	const quoted = preferredQuotedRequirement(quote.selected);
+	if (!quoted || quoted.amountUsd > maxProviderSpendUsd) {
+		return {
+			service: "AgenticBuyer",
+			version: VERSION,
+			executed: false,
+			error: "QUOTED_PAYMENT_NOT_COMPATIBLE",
+			provider: summarizeResource(quote.selected),
+			gate,
+		};
+	}
+
+	const fingerprint = await purchaseFingerprint({
+		query,
+		resource: quote.selected.resource,
+		requirement: quoted.requirement,
+	});
+
+	const reservation = await callSpendLedger(env, "/reserve", {
+		fingerprint,
+		amountUsd: quoted.amountUsd,
+		provider: quote.selected.resource,
+	});
+
+	if (reservation.allowed !== true) {
+		return {
+			service: "AgenticBuyer",
+			version: VERSION,
+			executed: false,
+			error: reservation.reason ?? "SPEND_RESERVATION_REJECTED",
+			message:
+				reservation.reason === "DUPLICATE_PURCHASE"
+					? "An identical provider purchase was already attempted recently."
+					: reservation.reason === "DAILY_SPEND_LIMIT_REACHED"
+						? `AgenticBuyer reached its $${HARD_DAILY_PROVIDER_SPEND_USD} daily provider-spend limit.`
+						: "AgenticBuyer could not reserve provider spend.",
+			provider: summarizeResource(quote.selected),
+			ledger: reservation,
+			gate,
+		};
+	}
+
 	const account = privateKeyToAccount(privateKey);
 	const client = new x402Client();
-
 	client.register(BASE_MAINNET, new ExactEvmScheme(account));
 
 	let approvedPaymentUsd: number | null = null;
@@ -769,50 +947,102 @@ async function executeProviderPurchase({
 			};
 		}
 
+		if (
+			selectedRequirements.amount !== quoted.requirement.amount ||
+			selectedRequirements.payTo?.toLowerCase() !==
+				quoted.requirement.payTo?.toLowerCase()
+		) {
+			return {
+				abort: true,
+				reason: "Provider payment differs from the reserved Bazaar quote.",
+			};
+		}
+
 		approvedPaymentUsd = validation.amountUsd;
 	});
 
 	const fetchWithPayment = wrapFetchWithPayment(fetch, client);
 	const httpClient = new x402HTTPClient(client);
 
-	const response = await fetchWithPayment(quote.selected.resource, {
-		method: "GET",
-		headers: {
-			accept: "application/json",
-		},
-	});
+	try {
+		const response = await fetchWithPayment(quote.selected.resource, {
+			method: "GET",
+			headers: {
+				accept: "application/json",
+			},
+		});
 
-	const providerResult = await httpClient.processResponse(response);
+		const providerResult = await httpClient.processResponse(response);
+		const settled = providerResult.paymentStatus === "settled";
 
-	if (!response.ok) {
+		const ledger = await callSpendLedger(env, "/finalize", {
+			fingerprint,
+			status: settled ? "settled" : "failed",
+			paymentStatus: providerResult.paymentStatus,
+		});
+
+		console.log({
+			event: "agenticbuyer_provider_purchase",
+			fingerprint,
+			providerHost: new URL(quote.selected.resource).hostname,
+			approvedPaymentUsd,
+			paymentStatus: providerResult.paymentStatus,
+			httpStatus: response.status,
+			settled,
+		});
+
+		if (!response.ok) {
+			return {
+				service: "AgenticBuyer",
+				version: VERSION,
+				executed: false,
+				error: "PROVIDER_REQUEST_FAILED",
+				httpStatus: response.status,
+				paymentStatus: providerResult.paymentStatus,
+				provider: summarizeResource(quote.selected),
+				providerPayment: providerResult.header ?? null,
+				providerResult: safeProviderBody(providerResult.body),
+				ledger,
+				gate,
+			};
+		}
+
 		return {
 			service: "AgenticBuyer",
 			version: VERSION,
-			executed: false,
-			error: "PROVIDER_REQUEST_FAILED",
-			httpStatus: response.status,
+			executed: true,
+			query,
+			maxProviderSpendUsd,
+			providerPaid: settled,
+			approvedProviderSpendUsd: approvedPaymentUsd,
 			paymentStatus: providerResult.paymentStatus,
 			provider: summarizeResource(quote.selected),
 			providerPayment: providerResult.header ?? null,
 			providerResult: safeProviderBody(providerResult.body),
+			ledger,
 			gate,
 		};
-	}
+	} catch (error) {
+		try {
+			await callSpendLedger(env, "/finalize", {
+				fingerprint,
+				status: "failed",
+				paymentStatus: "transport_error",
+			});
+		} catch {
+			// The original provider error is more important than a cleanup error.
+		}
 
-	return {
-		service: "AgenticBuyer",
-		version: VERSION,
-		executed: true,
-		query,
-		maxProviderSpendUsd,
-		providerPaid: providerResult.paymentStatus === "settled",
-		approvedProviderSpendUsd: approvedPaymentUsd,
-		paymentStatus: providerResult.paymentStatus,
-		provider: summarizeResource(quote.selected),
-		providerPayment: providerResult.header ?? null,
-		providerResult: safeProviderBody(providerResult.body),
-		gate,
-	};
+		console.log({
+			event: "agenticbuyer_provider_purchase",
+			fingerprint,
+			providerHost: new URL(quote.selected.resource).hostname,
+			status: "failed",
+			error: error instanceof Error ? error.message : "unknown",
+		});
+
+		throw error;
+	}
 }
 
 function createServer() {
@@ -1004,7 +1234,7 @@ export default {
 		}
 
 		if (url.pathname === "/spend-status") {
-			return Response.json(getSpendGateStatus(purchaseEnv));
+			return Response.json(await fullSpendStatus(purchaseEnv));
 		}
 
 		if (url.pathname === "/mcp") {
@@ -1040,6 +1270,10 @@ export default {
 				downstreamExecution: true,
 				liveSpendGate: true,
 				hardProviderSpendCapUsd: HARD_MAX_PROVIDER_SPEND_USD,
+				dailyProviderSpendCapUsd: HARD_DAILY_PROVIDER_SPEND_USD,
+				duplicatePurchaseProtection: true,
+				persistentSpendLedger: true,
+				structuredPurchaseLogging: true,
 			},
 		});
 	},
