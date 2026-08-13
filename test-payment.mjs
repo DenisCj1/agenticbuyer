@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+﻿import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { withX402Client } from "agents/x402";
@@ -38,9 +38,12 @@ const result = await paidClient.callTool(
 		return true;
 	},
 	{
-		name: "buyer_paid_test",
+		name: "buyer_quote",
 		arguments: {
-			request: "first paid AgenticBuyer transaction",
+			query: "weather forecast data",
+			budgetUsd: 0.05,
+			network: "base",
+			limit: 5,
 		},
 	},
 );
