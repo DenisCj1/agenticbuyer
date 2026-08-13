@@ -8,16 +8,21 @@ import { describe, it, expect } from "vitest";
 import worker, {
 	buildBazaarSearchUrl,
 	decideCandidates,
+	getSpendGateStatus,
+	isSafeProviderUrl,
 	normalizeNetwork,
 	rankBazaarResources,
 	usdcAssetForNetwork,
+	validateProviderPaymentRequirement,
 	type BazaarResource,
 } from "../src/index";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
+const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
 describe("AgenticBuyer worker", () => {
-	it("returns a healthy v0.6 response", async () => {
+	it("returns a healthy v0.7 response", async () => {
 		const request = new IncomingRequest("http://example.com/health");
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);
@@ -27,21 +32,34 @@ describe("AgenticBuyer worker", () => {
 		expect(await response.json()).toEqual({
 			status: "ok",
 			service: "AgenticBuyer",
-			version: "0.6.0",
+			version: "0.7.0",
 		});
 	});
 
-	it("exposes improved discovery capabilities", async () => {
+	it("exposes guarded downstream execution capabilities", async () => {
 		const response = await SELF.fetch("https://example.com/");
 		const body = (await response.json()) as {
 			version: string;
-			capabilities: Record<string, boolean>;
+			tools: { paid: string[] };
+			capabilities: Record<string, boolean | number>;
 		};
 
-		expect(body.version).toBe("0.6.0");
-		expect(body.capabilities.usdcAssetResolution).toBe(true);
-		expect(body.capabilities.inventoryFallback).toBe(true);
-		expect(body.capabilities.downstreamExecution).toBe(false);
+		expect(body.version).toBe("0.7.0");
+		expect(body.tools.paid).toContain("buyer_execute");
+		expect(body.capabilities.downstreamExecution).toBe(true);
+		expect(body.capabilities.liveSpendGate).toBe(true);
+		expect(body.capabilities.hardProviderSpendCapUsd).toBe(0.01);
+	});
+
+	it("keeps live spending locked by default", async () => {
+		const response = await SELF.fetch("https://example.com/spend-status");
+		const body = (await response.json()) as {
+			liveSpendEnabled: boolean;
+			hardMaxProviderSpendUsd: number;
+		};
+
+		expect(body.liveSpendEnabled).toBe(false);
+		expect(body.hardMaxProviderSpendUsd).toBe(0.01);
 	});
 });
 
@@ -52,9 +70,7 @@ describe("network and USDC resolution", () => {
 	});
 
 	it("resolves official Base USDC contract addresses", () => {
-		expect(usdcAssetForNetwork("base")).toBe(
-			"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-		);
+		expect(usdcAssetForNetwork("base")).toBe(BASE_USDC);
 		expect(usdcAssetForNetwork("base-sepolia")).toBe(
 			"0x036CbD53842c5426634e7929541eC2318f3dCF7e",
 		);
@@ -62,7 +78,7 @@ describe("network and USDC resolution", () => {
 });
 
 describe("AgenticBuyer Bazaar routing", () => {
-	it("uses an asset address instead of the invalid usdc alias", () => {
+	it("uses the Base USDC asset address", () => {
 		const url = new URL(
 			buildBazaarSearchUrl({
 				query: "crypto news",
@@ -73,10 +89,7 @@ describe("AgenticBuyer Bazaar routing", () => {
 		);
 
 		expect(url.searchParams.get("network")).toBe("eip155:8453");
-		expect(url.searchParams.get("asset")).toBe(
-			"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-		);
-		expect(url.searchParams.get("asset")).not.toBe("usdc");
+		expect(url.searchParams.get("asset")).toBe(BASE_USDC);
 		expect(url.searchParams.get("maxUsdPrice")).toBe("1");
 	});
 
@@ -102,9 +115,11 @@ describe("AgenticBuyer Bazaar routing", () => {
 				description: "Weather forecast",
 				accepts: [
 					{
+						scheme: "exact",
 						network: "eip155:8453",
-						asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+						asset: BASE_USDC,
 						amount: "10000",
+						payTo: "0x1111111111111111111111111111111111111111",
 					},
 				],
 			},
@@ -113,9 +128,11 @@ describe("AgenticBuyer Bazaar routing", () => {
 				description: "Crypto news and market intelligence",
 				accepts: [
 					{
+						scheme: "exact",
 						network: "eip155:8453",
-						asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+						asset: BASE_USDC,
 						amount: "20000",
+						payTo: "0x2222222222222222222222222222222222222222",
 					},
 				],
 				quality: { l30DaysTotalCalls: 1000, l30DaysUniquePayers: 100 },
@@ -135,9 +152,11 @@ describe("AgenticBuyer Bazaar routing", () => {
 				description: "Crypto news",
 				accepts: [
 					{
+						scheme: "exact",
 						network: "base",
-						asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+						asset: BASE_USDC,
 						amount: "20000",
+						payTo: "0x1111111111111111111111111111111111111111",
 					},
 				],
 			},
@@ -146,9 +165,11 @@ describe("AgenticBuyer Bazaar routing", () => {
 				description: "Crypto news",
 				accepts: [
 					{
+						scheme: "exact",
 						network: "eip155:8453",
-						asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+						asset: BASE_USDC,
 						amount: "120000",
+						payTo: "0x2222222222222222222222222222222222222222",
 					},
 				],
 			},
@@ -157,5 +178,94 @@ describe("AgenticBuyer Bazaar routing", () => {
 		const decision = decideCandidates(resources, 0.05, "crypto news", "base");
 		expect(decision.selected?.resource).toBe("https://example.com/cheap");
 		expect(decision.overBudgetAlternatives[0]?.budgetGapUsd).toBe(0.07);
+	});
+});
+
+describe("AgenticBuyer provider purchase safety", () => {
+	const selected: BazaarResource = {
+		resource: "https://x402.example.com/crypto-news",
+		description: "Crypto news",
+		accepts: [
+			{
+				scheme: "exact",
+				network: "eip155:8453",
+				asset: BASE_USDC,
+				amount: "1000",
+				payTo: "0x3333333333333333333333333333333333333333",
+			},
+		],
+	};
+
+	it("allows a discovered Base USDC payment under the hard cap", () => {
+		const validation = validateProviderPaymentRequirement({
+			selected,
+			paymentResourceUrl: selected.resource,
+			requirement: selected.accepts![0]!,
+			maxProviderSpendUsd: 0.01,
+		});
+
+		expect(validation.ok).toBe(true);
+		expect(validation.amountUsd).toBe(0.001);
+	});
+
+	it("rejects a provider price increase after discovery", () => {
+		const validation = validateProviderPaymentRequirement({
+			selected,
+			paymentResourceUrl: selected.resource,
+			requirement: {
+				...selected.accepts![0]!,
+				amount: "11000",
+			},
+			maxProviderSpendUsd: 0.01,
+		});
+
+		expect(validation.ok).toBe(false);
+		expect(validation.reason).toContain("above");
+	});
+
+	it("rejects changed payment details after discovery", () => {
+		const validation = validateProviderPaymentRequirement({
+			selected,
+			paymentResourceUrl: selected.resource,
+			requirement: {
+				...selected.accepts![0]!,
+				payTo: "0x4444444444444444444444444444444444444444",
+			},
+			maxProviderSpendUsd: 0.01,
+		});
+
+		expect(validation.ok).toBe(false);
+		expect(validation.reason).toContain("changed");
+	});
+
+	it("blocks unsafe provider URLs", () => {
+		expect(isSafeProviderUrl("https://api.example.com/data")).toBe(true);
+		expect(isSafeProviderUrl("http://api.example.com/data")).toBe(false);
+		expect(isSafeProviderUrl("https://localhost/data")).toBe(false);
+		expect(isSafeProviderUrl("https://127.0.0.1/data")).toBe(false);
+		expect(isSafeProviderUrl("https://192.168.1.10/data")).toBe(false);
+	});
+
+	it("requires the receiving wallet to match the secured buyer key", () => {
+		const testPrivateKey = `0x${"11".repeat(32)}`;
+		const first = getSpendGateStatus({
+			PAY_TO: "0x0000000000000000000000000000000000000000",
+			X402_NETWORK: "base-sepolia",
+			AGENTICBUYER_BUYER_PRIVATE_KEY: testPrivateKey,
+		} as never);
+
+		expect(first.buyerWalletConfigured).toBe(true);
+		expect(first.receivingWalletMatchesBuyer).toBe(false);
+		expect(first.buyerWalletAddress).not.toBeNull();
+
+		const matched = getSpendGateStatus({
+			PAY_TO: first.buyerWalletAddress!,
+			X402_NETWORK: "base-sepolia",
+			AGENTICBUYER_BUYER_PRIVATE_KEY: testPrivateKey,
+		} as never);
+
+		expect(matched.receivingWalletMatchesBuyer).toBe(true);
+		expect(matched.liveSpendEnabled).toBe(false);
+		expect(matched.readyToArm).toBe(true);
 	});
 });

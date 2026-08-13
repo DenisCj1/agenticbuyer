@@ -15,7 +15,7 @@
   "upload_source_maps": true,
 
   "vars": {
-    "PAY_TO": "0x3E6E3fA80A734D4C124753C9F547d90D09d4e264",
+    "PAY_TO": "0xc7F3a2F0df0BE61d3a6f3b16B71836329A33ce46",
     "X402_NETWORK": "base-sepolia"
   }
 }
