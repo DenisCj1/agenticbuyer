@@ -5,9 +5,14 @@ import { createMcpHandler } from "agents/mcp/server";
 import { withX402, type X402Config } from "agents/x402";
 import { z } from "zod";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const BAZAAR_SEARCH_ENDPOINT =
 	"https://api.cdp.coinbase.com/platform/v2/x402/discovery/search";
+
+const USDC_BY_NETWORK: Record<string, string> = {
+	"eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+	"eip155:84532": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+};
 
 type BazaarPaymentRequirement = {
 	scheme?: string;
@@ -46,6 +51,7 @@ type BazaarSearchResponse = {
 export type RankedResource = BazaarResource & {
 	agenticBuyerScore: number;
 	estimatedUsdPrice: number | null;
+	textRelevance: number;
 };
 
 export type CandidateDecision = {
@@ -62,6 +68,24 @@ function roundUsd(value: number) {
 	return Math.round(value * 1_000_000) / 1_000_000;
 }
 
+export function normalizeNetwork(network: string) {
+	const value = network.trim().toLowerCase();
+
+	if (value === "base" || value === "base-mainnet" || value === "eip155:8453") {
+		return "eip155:8453";
+	}
+
+	if (value === "base-sepolia" || value === "eip155:84532") {
+		return "eip155:84532";
+	}
+
+	return network.trim();
+}
+
+export function usdcAssetForNetwork(network: string) {
+	return USDC_BY_NETWORK[normalizeNetwork(network)] ?? null;
+}
+
 function usdcAmountToUsd(amount?: string): number | null {
 	if (!amount || !/^\d+$/.test(amount)) return null;
 
@@ -75,39 +99,90 @@ function usdcAmountToUsd(amount?: string): number | null {
 	}
 }
 
-function lowestUsdcPrice(resource: BazaarResource): number | null {
+function lowestUsdcPrice(resource: BazaarResource, network: string): number | null {
+	const normalizedNetwork = normalizeNetwork(network);
+	const expectedAsset = usdcAssetForNetwork(normalizedNetwork)?.toLowerCase();
+
 	const prices = (resource.accepts ?? [])
+		.filter((requirement) => {
+			const requirementNetwork = requirement.network
+				? normalizeNetwork(requirement.network)
+				: null;
+			const asset = requirement.asset?.toLowerCase();
+
+			return (
+				(!requirementNetwork || requirementNetwork === normalizedNetwork) &&
+				(!expectedAsset || !asset || asset === expectedAsset)
+			);
+		})
 		.map((requirement) => usdcAmountToUsd(requirement.amount))
 		.filter((price): price is number => price !== null && Number.isFinite(price));
 
 	return prices.length > 0 ? Math.min(...prices) : null;
 }
 
+function relevanceForQuery(resource: BazaarResource, query: string) {
+	const normalizedQuery = query.trim().toLowerCase();
+	if (!normalizedQuery) return 0;
+
+	const tokens = normalizedQuery
+		.split(/[^a-z0-9]+/)
+		.map((token) => token.trim())
+		.filter((token) => token.length >= 2);
+
+	const haystack = [
+		resource.serviceName,
+		resource.description,
+		resource.resource,
+		...(resource.tags ?? []),
+	]
+		.filter(Boolean)
+		.join(" ")
+		.toLowerCase();
+
+	let score = haystack.includes(normalizedQuery) ? 30 : 0;
+
+	for (const token of new Set(tokens)) {
+		if (haystack.includes(token)) score += 8;
+	}
+
+	return Math.min(score, 50);
+}
+
 export function rankBazaarResources(
 	resources: BazaarResource[],
 	budgetUsd: number,
+	query: string,
+	network: string,
 ): RankedResource[] {
 	return resources
 		.map((resource, index) => {
-			const price = lowestUsdcPrice(resource);
+			const price = lowestUsdcPrice(resource, network);
 			const calls = Math.max(0, resource.quality?.l30DaysTotalCalls ?? 0);
 			const payers = Math.max(0, resource.quality?.l30DaysUniquePayers ?? 0);
+			const textRelevance = relevanceForQuery(resource, query);
 
-			const relevanceScore = Math.max(0, 40 - index * 5);
+			const bazaarOrderScore = Math.max(0, 20 - index * 2);
 			const priceScore =
 				price !== null && budgetUsd > 0
-					? Math.max(0, 25 * (1 - Math.min(price / budgetUsd, 1)))
+					? Math.max(0, 20 * (1 - Math.min(price / budgetUsd, 1)))
 					: 0;
-			const payerScore = Math.min(20, Math.log10(payers + 1) * 10);
-			const usageScore = Math.min(15, Math.log10(calls + 1) * 5);
+			const payerScore = Math.min(10, Math.log10(payers + 1) * 5);
+			const usageScore = Math.min(10, Math.log10(calls + 1) * 3);
 
 			return {
 				...resource,
 				agenticBuyerScore:
 					Math.round(
-						(relevanceScore + priceScore + payerScore + usageScore) * 100,
+						(textRelevance +
+							bazaarOrderScore +
+							priceScore +
+							payerScore +
+							usageScore) *
+							100,
 					) / 100,
 				estimatedUsdPrice: price,
+				textRelevance,
 			};
 		})
 		.sort((a, b) => b.agenticBuyerScore - a.agenticBuyerScore);
@@ -116,8 +191,10 @@ export function rankBazaarResources(
 export function decideCandidates(
 	resources: BazaarResource[],
 	budgetUsd: number,
+	query: string,
+	network: string,
 ): CandidateDecision {
-	const ranked = rankBazaarResources(resources, budgetUsd);
+	const ranked = rankBazaarResources(resources, budgetUsd, query, network);
 
 	const withinBudget = ranked.filter(
 		(candidate) =>
@@ -152,17 +229,30 @@ export function buildBazaarSearchUrl({
 	query,
 	budgetUsd,
 	network = "base",
-	limit = 5,
+	limit = 10,
+	includeQuery = true,
 }: {
 	query: string;
 	budgetUsd?: number;
 	network?: string;
 	limit?: number;
+	includeQuery?: boolean;
 }) {
+	const normalizedNetwork = normalizeNetwork(network);
+	const asset = usdcAssetForNetwork(normalizedNetwork);
 	const url = new URL(BAZAAR_SEARCH_ENDPOINT);
-	url.searchParams.set("query", query.trim());
-	url.searchParams.set("network", network);
-	url.searchParams.set("asset", "usdc");
+
+	if (includeQuery && query.trim()) {
+		url.searchParams.set("query", query.trim());
+	}
+
+	url.searchParams.set("network", normalizedNetwork);
+
+	// Coinbase Bazaar's current REST API expects an asset address,
+	// not the human-readable "usdc" alias.
+	if (asset) {
+		url.searchParams.set("asset", asset);
+	}
 
 	if (budgetUsd !== undefined) {
 		url.searchParams.set("maxUsdPrice", String(budgetUsd));
@@ -177,17 +267,20 @@ async function searchBazaar({
 	budgetUsd,
 	network,
 	limit,
+	includeQuery = true,
 }: {
 	query: string;
 	budgetUsd?: number;
 	network: string;
 	limit: number;
+	includeQuery?: boolean;
 }): Promise<BazaarSearchResponse> {
 	const searchUrl = buildBazaarSearchUrl({
 		query,
 		budgetUsd,
 		network,
 		limit,
+		includeQuery,
 	});
 
 	const response = await fetch(searchUrl, {
@@ -214,42 +307,55 @@ async function createBuyerQuote({
 	network: string;
 	limit: number;
 }) {
-	const inBudgetSearch = await searchBazaar({
+	const normalizedNetwork = normalizeNetwork(network);
+	const discoverySteps: string[] = [];
+
+	let result = await searchBazaar({
 		query,
 		budgetUsd,
-		network,
+		network: normalizedNetwork,
 		limit,
 	});
+	discoverySteps.push("semantic_budget_search");
 
-	let marketSearchUsed = false;
-	let resources = inBudgetSearch.resources ?? [];
-	let partialResults = inBudgetSearch.partialResults ?? false;
-	let searchMethod = inBudgetSearch.searchMethod ?? "unknown";
+	let resources = result.resources ?? [];
 
-	// A useful buyer should not simply stop when a strict budget search is empty.
-	// Scan the same market without the price ceiling so the caller can see the
-	// nearest alternatives and exactly how far they are above budget.
 	if (resources.length === 0) {
-		const marketSearch = await searchBazaar({
+		result = await searchBazaar({
 			query,
-			network,
+			network: normalizedNetwork,
 			limit: Math.max(limit, 10),
 		});
-
-		marketSearchUsed = true;
-		resources = marketSearch.resources ?? [];
-		partialResults = marketSearch.partialResults ?? false;
-		searchMethod = marketSearch.searchMethod ?? searchMethod;
+		resources = result.resources ?? [];
+		discoverySteps.push("semantic_market_search");
 	}
 
-	const decision = decideCandidates(resources, budgetUsd);
+	if (resources.length === 0) {
+		result = await searchBazaar({
+			query,
+			network: normalizedNetwork,
+			limit: 20,
+			includeQuery: false,
+		});
+		resources = result.resources ?? [];
+		discoverySteps.push("network_inventory_fallback");
+	}
+
+	const decision = decideCandidates(
+		resources,
+		budgetUsd,
+		query,
+		normalizedNetwork,
+	);
 	const closestOverBudget = decision.overBudgetAlternatives[0] ?? null;
 
 	const marketStatus = decision.selected
 		? "MATCH_FOUND"
 		: closestOverBudget
 			? "OVER_BUDGET_OPTIONS_FOUND"
-			: "NO_MATCH";
+			: resources.length > 0
+				? "MARKET_FOUND_NO_USDC_PRICE"
+				: "NO_MATCH";
 
 	return {
 		service: "AgenticBuyer",
@@ -257,22 +363,25 @@ async function createBuyerQuote({
 		quoteType: "x402-provider-route",
 		query,
 		budgetUsd,
-		network,
+		network: normalizedNetwork,
+		asset: usdcAssetForNetwork(normalizedNetwork),
 		currency: "USDC",
 		marketStatus,
-		marketSearchUsed,
+		discoverySteps,
 		selected: decision.selected,
 		alternatives: decision.alternatives,
 		overBudgetAlternatives: decision.overBudgetAlternatives,
 		candidateCount: resources.length,
-		partialResults,
-		searchMethod,
+		partialResults: result.partialResults ?? false,
+		searchMethod: result.searchMethod ?? "unknown",
 		executionReady: Boolean(decision.selected),
 		nextAction: decision.selected
 			? "A provider is inside budget. AgenticBuyer can prepare this route for downstream purchase execution."
 			: closestOverBudget
 				? `No provider is inside the $${budgetUsd} budget. The closest observed option is $${closestOverBudget.estimatedUsdPrice}, which is $${closestOverBudget.budgetGapUsd} over budget.`
-				: "No relevant provider was found in the current Bazaar results. Broaden the request or try another network.",
+				: resources.length > 0
+					? "Providers were discovered, but AgenticBuyer could not derive a compatible USDC price from the returned payment requirements."
+					: "No compatible Base USDC provider was found in the current Bazaar results.",
 	};
 }
 
@@ -349,7 +458,7 @@ function createPaidServer(env: Env) {
 
 	server.paidTool(
 		"buyer_quote",
-		"Search the x402 Bazaar, enforce a provider budget, score candidates, and return AgenticBuyer's preferred provider route plus nearest over-budget alternatives when necessary.",
+		"Discover x402 services, enforce a USDC budget, rank compatible providers, and return AgenticBuyer's preferred route plus alternatives.",
 		0.01,
 		{
 			query: z.string().min(2).max(300),
@@ -364,7 +473,7 @@ function createPaidServer(env: Env) {
 					query,
 					budgetUsd,
 					network: network ?? "base",
-					limit: limit ?? 5,
+					limit: limit ?? 10,
 				});
 
 				return {
@@ -437,7 +546,9 @@ export default {
 				discovery: true,
 				budgetEnforcement: true,
 				qualityRanking: true,
-				overBudgetFallback: true,
+				networkNormalization: true,
+				usdcAssetResolution: true,
+				inventoryFallback: true,
 				downstreamExecution: false,
 			},
 		});

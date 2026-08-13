@@ -40,7 +40,7 @@ const result = await paidClient.callTool(
 	{
 		name: "buyer_quote",
 		arguments: {
-			query: "data API",
+			query: "crypto news",
 			budgetUsd: 1,
 			network: "base",
 			limit: 10,
