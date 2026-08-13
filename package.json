@@ -17,6 +17,7 @@
     "wrangler": "^4.121.0"
   },
   "dependencies": {
+    "@coinbase/x402": "2.1.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "@x402/core": "^2.22.0",

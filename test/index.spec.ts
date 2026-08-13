@@ -8,6 +8,7 @@ import { describe, it, expect } from "vitest";
 import worker, {
 	buildBazaarSearchUrl,
 	decideCandidates,
+	getIncomingPaymentStatus,
 	getSpendGateStatus,
 	isSafeProviderUrl,
 	normalizeNetwork,
@@ -22,7 +23,7 @@ const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 describe("AgenticBuyer worker", () => {
-	it("returns a healthy v0.8 response", async () => {
+	it("returns a healthy v0.9 response", async () => {
 		const request = new IncomingRequest("http://example.com/health");
 		const ctx = createExecutionContext();
 		const response = await worker.fetch(request, env, ctx);
@@ -32,7 +33,7 @@ describe("AgenticBuyer worker", () => {
 		expect(await response.json()).toEqual({
 			status: "ok",
 			service: "AgenticBuyer",
-			version: "0.8.0",
+			version: "0.9.0",
 		});
 	});
 
@@ -41,10 +42,11 @@ describe("AgenticBuyer worker", () => {
 		const body = (await response.json()) as {
 			version: string;
 			tools: { paid: string[] };
+			network: string;
 			capabilities: Record<string, boolean | number>;
 		};
 
-		expect(body.version).toBe("0.8.0");
+		expect(body.version).toBe("0.9.0");
 		expect(body.tools.paid).toContain("buyer_execute");
 		expect(body.capabilities.downstreamExecution).toBe(true);
 		expect(body.capabilities.liveSpendGate).toBe(true);
@@ -52,6 +54,8 @@ describe("AgenticBuyer worker", () => {
 		expect(body.capabilities.dailyProviderSpendCapUsd).toBe(0.05);
 		expect(body.capabilities.duplicatePurchaseProtection).toBe(true);
 		expect(body.capabilities.persistentSpendLedger).toBe(true);
+		expect(body.network).toBe("eip155:8453");
+		expect(body.capabilities.cdpFacilitator).toBe(true);
 	});
 
 	it("keeps live spending locked by default", async () => {
@@ -63,6 +67,29 @@ describe("AgenticBuyer worker", () => {
 
 		expect(body.liveSpendEnabled).toBe(false);
 		expect(body.hardMaxProviderSpendUsd).toBe(0.01);
+	});
+});
+
+describe("AgenticBuyer production incoming payment configuration", () => {
+	it("requires both CDP credentials and keeps provider spending locked", () => {
+		const missing = getIncomingPaymentStatus({
+			PAY_TO: "0x0000000000000000000000000000000000000000",
+			X402_NETWORK: "eip155:8453",
+		} as never);
+
+		expect(missing.productionIncomingPaymentsConfigured).toBe(false);
+		expect(missing.network).toBe("eip155:8453");
+		expect(missing.liveProviderSpendEnabled).toBe(false);
+
+		const configured = getIncomingPaymentStatus({
+			PAY_TO: "0x0000000000000000000000000000000000000000",
+			X402_NETWORK: "eip155:8453",
+			CDP_API_KEY_ID: "test-id",
+			CDP_API_KEY_SECRET: "test-secret",
+		} as never);
+
+		expect(configured.productionIncomingPaymentsConfigured).toBe(true);
+		expect(configured.liveProviderSpendEnabled).toBe(false);
 	});
 });
 

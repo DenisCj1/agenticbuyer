@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { McpServer as LegacyMcpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { x402Client, wrapFetchWithPayment, x402HTTPClient } from "@x402/fetch";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
+import { createFacilitatorConfig } from "@coinbase/x402";
+import { HTTPFacilitatorClient } from "@x402/core/server";
 import { createLegacyMcpHandler } from "agents/mcp";
 import { createMcpHandler } from "agents/mcp/server";
 import { withX402, type X402Config } from "agents/x402";
@@ -9,12 +11,13 @@ import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 export { SpendLedger } from "./spend-ledger";
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const BAZAAR_SEARCH_ENDPOINT =
 	"https://api.cdp.coinbase.com/platform/v2/x402/discovery/search";
 
 const BASE_MAINNET = "eip155:8453";
 const BASE_SEPOLIA = "eip155:84532";
+const CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402";
 const HARD_MAX_PROVIDER_SPEND_USD = 0.01;
 const HARD_DAILY_PROVIDER_SPEND_USD = 0.05;
 const DUPLICATE_PURCHASE_WINDOW_MS = 10 * 60 * 1000;
@@ -37,6 +40,8 @@ type SpendLedgerNamespace = {
 type PurchaseEnv = Env & {
 	AGENTICBUYER_BUYER_PRIVATE_KEY?: string;
 	AGENTICBUYER_LIVE_SPEND_ENABLED?: string;
+	CDP_API_KEY_ID?: string;
+	CDP_API_KEY_SECRET?: string;
 	SPEND_LEDGER?: SpendLedgerNamespace;
 };
 
@@ -1076,13 +1081,74 @@ function createServer() {
 	return server;
 }
 
+function createCdpFacilitatorConfig(env: PurchaseEnv) {
+	const apiKeyId = env.CDP_API_KEY_ID?.trim();
+	const apiKeySecret = env.CDP_API_KEY_SECRET?.trim();
+
+	if (!apiKeyId || !apiKeySecret) {
+		throw new Error("Coinbase production x402 credentials are not configured.");
+	}
+
+	return createFacilitatorConfig(apiKeyId, apiKeySecret);
+}
+
+export function getIncomingPaymentStatus(env: PurchaseEnv) {
+	const cdpApiKeyIdConfigured = Boolean(env.CDP_API_KEY_ID?.trim());
+	const cdpApiKeySecretConfigured = Boolean(env.CDP_API_KEY_SECRET?.trim());
+
+	return {
+		service: "AgenticBuyer",
+		version: VERSION,
+		network: BASE_MAINNET,
+		currency: "USDC",
+		facilitator: CDP_FACILITATOR_URL,
+		cdpApiKeyIdConfigured,
+		cdpApiKeySecretConfigured,
+		productionIncomingPaymentsConfigured:
+			cdpApiKeyIdConfigured && cdpApiKeySecretConfigured,
+		liveProviderSpendEnabled:
+			env.AGENTICBUYER_LIVE_SPEND_ENABLED?.trim().toLowerCase() === "true",
+	};
+}
+
+async function getCdpFacilitatorStatus(env: PurchaseEnv) {
+	try {
+		const client = new HTTPFacilitatorClient(createCdpFacilitatorConfig(env));
+		const supported = await client.getSupported();
+		const kinds = supported.kinds.map((kind) => ({
+			x402Version: kind.x402Version,
+			scheme: kind.scheme,
+			network: kind.network,
+		}));
+
+		return {
+			service: "AgenticBuyer",
+			version: VERSION,
+			authenticated: true,
+			facilitator: CDP_FACILITATOR_URL,
+			baseMainnetSupported: kinds.some(
+				(kind) => kind.scheme === "exact" && kind.network === BASE_MAINNET,
+			),
+			supportedKindCount: kinds.length,
+			kinds,
+		};
+	} catch {
+		return {
+			service: "AgenticBuyer",
+			version: VERSION,
+			authenticated: false,
+			facilitator: CDP_FACILITATOR_URL,
+			baseMainnetSupported: false,
+			error: "CDP_FACILITATOR_AUTH_FAILED",
+		};
+	}
+}
+
 function createPaidServer(env: PurchaseEnv) {
 	const config: X402Config = {
-		network: env.X402_NETWORK as X402Config["network"],
+		network: BASE_MAINNET,
 		recipient: env.PAY_TO,
-		facilitator: {
-			url: "https://x402.org/facilitator",
-		},
+		facilitator: createCdpFacilitatorConfig(env),
 	};
 
 	const server = withX402(
@@ -1237,6 +1303,17 @@ export default {
 			return Response.json(await fullSpendStatus(purchaseEnv));
 		}
 
+		if (url.pathname === "/payment-status") {
+			return Response.json(getIncomingPaymentStatus(purchaseEnv));
+		}
+
+		if (url.pathname === "/facilitator-status") {
+			const status = await getCdpFacilitatorStatus(purchaseEnv);
+			return Response.json(status, {
+				status: status.authenticated && status.baseMainnetSupported ? 200 : 503,
+			});
+		}
+
 		if (url.pathname === "/mcp") {
 			return createMcpHandler(createServer)(request, env, ctx);
 		}
@@ -1255,7 +1332,9 @@ export default {
 			mcp: "/mcp",
 			paidMcp: "/paid-mcp",
 			spendStatus: "/spend-status",
-			network: env.X402_NETWORK,
+			paymentStatus: "/payment-status",
+			facilitatorStatus: "/facilitator-status",
+			network: BASE_MAINNET,
 			tools: {
 				free: ["buyer_ping"],
 				paid: ["buyer_paid_test", "buyer_quote", "buyer_execute"],
@@ -1274,6 +1353,10 @@ export default {
 				duplicatePurchaseProtection: true,
 				persistentSpendLedger: true,
 				structuredPurchaseLogging: true,
+				productionIncomingPaymentsConfigured:
+					getIncomingPaymentStatus(purchaseEnv)
+						.productionIncomingPaymentsConfigured,
+				cdpFacilitator: true,
 			},
 		});
 	},
